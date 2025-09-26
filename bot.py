@@ -12,11 +12,11 @@ import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.filters import BaseFilter
 
 # --- Config from env ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgresql://user:pass@host:port/dbname
-# Optional: set number of connections
 DB_MIN_SIZE = int(os.environ.get("DB_MIN_SIZE", "1"))
 DB_MAX_SIZE = int(os.environ.get("DB_MAX_SIZE", "10"))
 
@@ -37,17 +37,13 @@ def count_bees_in_message(msg: Message) -> int:
     Count occurrences of the bee emoji in message text, caption, and sticker emoji.
     """
     count = 0
-    # text
     if msg.text:
         count += msg.text.count(BEE)
-    # caption (for photos, videos, etc.)
     if msg.caption:
         count += msg.caption.count(BEE)
-    # emoji in sticker (some stickers have .emoji attribute)
     sticker = getattr(msg, "sticker", None)
     if sticker and getattr(sticker, "emoji", None):
         count += sticker.emoji.count(BEE)
-    # For message.entities that might combine emoji, the plain text counts already cover it.
     return count
 
 # --- DB layer ---
@@ -62,7 +58,6 @@ class DB:
             min_size=DB_MIN_SIZE,
             max_size=DB_MAX_SIZE,
         )
-        # Create tables if not exists
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -86,12 +81,7 @@ class DB:
             self.pool = None
 
     async def add_message_count(self, chat_id: int, message_id: int, bees: int):
-        """
-        Insert message record if not exists and add bees to chat total.
-        If message already present, ignore (shouldn't happen on new message).
-        """
         if bees == 0:
-            # Still store a zero record to be able to handle future edits reliably
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -102,7 +92,6 @@ class DB:
                     chat_id, message_id, 0
                 )
             return
-
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -113,7 +102,6 @@ class DB:
                     """,
                     chat_id, message_id, bees
                 )
-                # add to chats
                 await conn.execute(
                     """
                     INSERT INTO chats(chat_id, total_bees)
@@ -124,10 +112,6 @@ class DB:
                 )
 
     async def update_message_on_edit(self, chat_id: int, message_id: int, new_bees: int):
-        """
-        If message existed before — calculate diff and update chat total.
-        If not existed — insert as new message and add to total.
-        """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -147,7 +131,6 @@ class DB:
                         new_bees, chat_id, message_id
                     )
                 else:
-                    # Insert message record and apply new_bees
                     await conn.execute(
                         "INSERT INTO messages(chat_id, message_id, bees_count) VALUES($1,$2,$3)",
                         chat_id, message_id, new_bees
@@ -167,9 +150,6 @@ class DB:
             return row["total_bees"] if row else 0
 
     async def ensure_zero_message(self, chat_id: int, message_id: int):
-        """
-        Ensure there's an entry for a message (bees_count 0) — used when we see a message with 0 bees.
-        """
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO messages(chat_id, message_id, bees_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING",
@@ -179,8 +159,12 @@ class DB:
 # --- Bot setup ---
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
-
 db = DB()
+
+# --- Filter to allow messages from private, group, supergroup ---
+class AllChatsFilter(BaseFilter):
+    async def __call__(self, message: types.Message) -> bool:
+        return message.chat.type in {"private", "group", "supergroup"}
 
 # --- Handlers ---
 @dp.message(Command(commands=["start"]))
@@ -203,23 +187,20 @@ async def cmd_pchol(message: types.Message):
     total = await db.get_total(chat_id)
     await message.reply(f"В этом чате улей на {total} ПЧОЛОВ 🐝")
 
-# New messages
+# --- New messages handler ---
 async def on_new_message(message: types.Message):
-    # Only count for group/supergroup and private chats as well
     try:
         chat_id = message.chat.id
         message_id = message.message_id
         bees = count_bees_in_message(message)
         if bees == 0:
-            # still record to messages table for future edits
             await db.ensure_zero_message(chat_id, message_id)
         else:
             await db.add_message_count(chat_id, message_id, bees)
-        # no reply to keep it silent
     except Exception as e:
         logger.exception("Error handling new message: %s", e)
 
-# Edited messages
+# --- Edited messages handler ---
 async def on_edited_message(message: types.Message):
     try:
         chat_id = message.chat.id
@@ -229,9 +210,9 @@ async def on_edited_message(message: types.Message):
     except Exception as e:
         logger.exception("Error handling edited message: %s", e)
 
-# Register generic handlers
-dp.message.register(on_new_message)  # catches all messages
-dp.edited_message.register(on_edited_message)  # catches edited messages
+# Register generic handlers with filter for all chats
+dp.message.register(on_new_message, AllChatsFilter())
+dp.edited_message.register(on_edited_message, AllChatsFilter())
 
 # --- Startup / shutdown ---
 async def on_startup():
@@ -248,14 +229,10 @@ async def on_shutdown():
 async def main():
     try:
         await on_startup()
-        # start polling (long polling)
         logger.info("Starting polling...")
-        # This call blocks until process is stopped.
         await dp.start_polling(bot)
     finally:
         await on_shutdown()
 
 if __name__ == "__main__":
-    # Run the bot
     asyncio.run(main())
-  
