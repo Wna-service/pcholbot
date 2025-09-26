@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # bot.py — Bee (ПЧОЛ) counter for Telegram (aiogram 3.x)
 # Single-file bot for Railway + PostgreSQL
-# Requirements in instructions below.
 
 import os
 import asyncio
@@ -33,9 +32,6 @@ logger = logging.getLogger("pchol_bot")
 BEE = "🐝"
 
 def count_bees_in_message(msg: Message) -> int:
-    """
-    Count occurrences of the bee emoji in message text, caption, and sticker emoji.
-    """
     count = 0
     if msg.text:
         count += msg.text.count(BEE)
@@ -80,16 +76,24 @@ class DB:
             await self.pool.close()
             self.pool = None
 
+    async def ensure_chat_exists(self, chat_id: int):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO chats(chat_id,total_bees) VALUES($1,0) ON CONFLICT DO NOTHING",
+                chat_id
+            )
+
     async def add_message_count(self, chat_id: int, message_id: int, bees: int):
+        await self.ensure_chat_exists(chat_id)
         if bees == 0:
             async with self.pool.acquire() as conn:
                 await conn.execute(
                     """
                     INSERT INTO messages(chat_id, message_id, bees_count)
-                    VALUES($1, $2, $3)
+                    VALUES($1, $2, 0)
                     ON CONFLICT (chat_id, message_id) DO NOTHING
                     """,
-                    chat_id, message_id, 0
+                    chat_id, message_id
                 )
             return
         async with self.pool.acquire() as conn:
@@ -112,6 +116,7 @@ class DB:
                 )
 
     async def update_message_on_edit(self, chat_id: int, message_id: int, new_bees: int):
+        await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -145,11 +150,13 @@ class DB:
                     )
 
     async def get_total(self, chat_id: int) -> int:
+        await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT total_bees FROM chats WHERE chat_id = $1", chat_id)
             return row["total_bees"] if row else 0
 
     async def ensure_zero_message(self, chat_id: int, message_id: int):
+        await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO messages(chat_id, message_id, bees_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING",
@@ -188,7 +195,7 @@ async def cmd_pchol(message: types.Message):
     await message.reply(f"В этом чате улей на {total} ПЧОЛОВ 🐝")
 
 # --- New messages handler ---
-async def on_new_message(message: types.Message):
+async def on_new_message(message: Message):
     try:
         chat_id = message.chat.id
         message_id = message.message_id
@@ -201,7 +208,7 @@ async def on_new_message(message: types.Message):
         logger.exception("Error handling new message: %s", e)
 
 # --- Edited messages handler ---
-async def on_edited_message(message: types.Message):
+async def on_edited_message(message: Message):
     try:
         chat_id = message.chat.id
         message_id = message.message_id
