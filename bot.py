@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # bot.py — Bee (ПЧОЛ) counter for Telegram (aiogram 3.x)
-# Single-file bot for Railway + PostgreSQL
 
 import os
 import asyncio
@@ -13,22 +12,20 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.filters import BaseFilter
 
-# --- Config from env ---
+# --- Config ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # e.g. postgresql://user:pass@host:port/dbname
+DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_MIN_SIZE = int(os.environ.get("DB_MIN_SIZE", "1"))
 DB_MAX_SIZE = int(os.environ.get("DB_MAX_SIZE", "10"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("Environment variable BOT_TOKEN is required.")
-if not DATABASE_URL:
-    raise RuntimeError("Environment variable DATABASE_URL is required.")
+if not BOT_TOKEN or not DATABASE_URL:
+    raise RuntimeError("BOT_TOKEN and DATABASE_URL env vars required.")
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pchol_bot")
 
-# --- Helper: count bees in a message ---
+# --- Helper ---
 BEE = "🐝"
 
 def count_bees_in_message(msg: Message) -> int:
@@ -42,7 +39,7 @@ def count_bees_in_message(msg: Message) -> int:
         count += sticker.emoji.count(BEE)
     return count
 
-# --- DB layer ---
+# --- DB ---
 class DB:
     def __init__(self):
         self.pool: Optional[asyncpg.pool.Pool] = None
@@ -64,12 +61,13 @@ class DB:
                 CREATE TABLE IF NOT EXISTS messages (
                     chat_id BIGINT NOT NULL,
                     message_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
                     bees_count INT NOT NULL DEFAULT 0,
                     PRIMARY KEY(chat_id, message_id)
                 );
                 """
             )
-        logger.info("Database connected and tables ensured.")
+        logger.info("DB ready.")
 
     async def close(self):
         if self.pool:
@@ -83,141 +81,139 @@ class DB:
                 chat_id
             )
 
-    async def add_message_count(self, chat_id: int, message_id: int, bees: int):
+    async def add_message_count(self, chat_id: int, message_id: int, bees: int, user_id: int):
         await self.ensure_chat_exists(chat_id)
-        if bees == 0:
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO messages(chat_id, message_id, bees_count)
-                    VALUES($1, $2, 0)
-                    ON CONFLICT (chat_id, message_id) DO NOTHING
-                    """,
-                    chat_id, message_id
-                )
-            return
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
                     """
-                    INSERT INTO messages(chat_id, message_id, bees_count)
-                    VALUES($1, $2, $3)
-                    ON CONFLICT (chat_id, message_id) DO NOTHING
+                    INSERT INTO messages(chat_id,message_id,user_id,bees_count)
+                    VALUES($1,$2,$3,$4)
+                    ON CONFLICT (chat_id,message_id) DO NOTHING
                     """,
-                    chat_id, message_id, bees
+                    chat_id, message_id, user_id, bees
                 )
-                await conn.execute(
-                    """
-                    INSERT INTO chats(chat_id, total_bees)
-                    VALUES($1, $2)
-                    ON CONFLICT (chat_id) DO UPDATE SET total_bees = chats.total_bees + $2
-                    """,
-                    chat_id, bees
-                )
+                if bees > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO chats(chat_id,total_bees)
+                        VALUES($1,$2)
+                        ON CONFLICT (chat_id) DO UPDATE
+                        SET total_bees=chats.total_bees+$2
+                        """,
+                        chat_id, bees
+                    )
 
-    async def update_message_on_edit(self, chat_id: int, message_id: int, new_bees: int):
+    async def update_message_on_edit(self, chat_id: int, message_id: int, new_bees: int, user_id: int):
         await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT bees_count FROM messages WHERE chat_id = $1 AND message_id = $2",
+                    "SELECT bees_count FROM messages WHERE chat_id=$1 AND message_id=$2",
                     chat_id, message_id
                 )
                 if row:
-                    old = row["bees_count"]
-                    diff = new_bees - old
+                    diff = new_bees - row["bees_count"]
                     if diff != 0:
                         await conn.execute(
-                            "UPDATE chats SET total_bees = total_bees + $1 WHERE chat_id = $2",
+                            "UPDATE chats SET total_bees=total_bees+$1 WHERE chat_id=$2",
                             diff, chat_id
                         )
                     await conn.execute(
-                        "UPDATE messages SET bees_count = $1 WHERE chat_id = $2 AND message_id = $3",
-                        new_bees, chat_id, message_id
+                        "UPDATE messages SET bees_count=$1,user_id=$2 WHERE chat_id=$3 AND message_id=$4",
+                        new_bees, user_id, chat_id, message_id
                     )
                 else:
-                    await conn.execute(
-                        "INSERT INTO messages(chat_id, message_id, bees_count) VALUES($1,$2,$3)",
-                        chat_id, message_id, new_bees
-                    )
-                    await conn.execute(
-                        """
-                        INSERT INTO chats(chat_id, total_bees)
-                        VALUES($1, $2)
-                        ON CONFLICT (chat_id) DO UPDATE SET total_bees = chats.total_bees + $2
-                        """,
-                        chat_id, new_bees
-                    )
+                    await self.add_message_count(chat_id, message_id, new_bees, user_id)
 
     async def get_total(self, chat_id: int) -> int:
         await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT total_bees FROM chats WHERE chat_id = $1", chat_id)
+            row = await conn.fetchrow("SELECT total_bees FROM chats WHERE chat_id=$1", chat_id)
             return row["total_bees"] if row else 0
 
-    async def ensure_zero_message(self, chat_id: int, message_id: int):
+    async def ensure_zero_message(self, chat_id: int, message_id: int, user_id: int):
         await self.ensure_chat_exists(chat_id)
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO messages(chat_id, message_id, bees_count) VALUES($1,$2,0) ON CONFLICT DO NOTHING",
-                chat_id, message_id
+                """
+                INSERT INTO messages(chat_id,message_id,user_id,bees_count)
+                VALUES($1,$2,$3,0)
+                ON CONFLICT DO NOTHING
+                """,
+                chat_id, message_id, user_id
             )
 
-# --- Bot setup ---
+# --- Bot ---
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 db = DB()
 
-# --- Filter to allow messages from private, group, supergroup ---
 class AllChatsFilter(BaseFilter):
     async def __call__(self, message: types.Message) -> bool:
         return message.chat.type in {"private", "group", "supergroup"}
 
 # --- Handlers ---
 @dp.message(Command(commands=["start"]))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: Message):
     if message.chat.type == "private":
-        text = (
+        await message.reply(
             "Привет! Это счётчик отправленных ПЧОЛ 🐝\n\n"
-            "Добавь меня в групповой чат (и отключи режим конфиденциальности у BotFather / сделай меня админом), "
-            "и я буду считать все 🐝 в этом «УЛЕЙЕ».\n\n"
-            "Команды:\n"
-            "/pchol — отправляет общее количество ПЧОЛ в текущем чате."
+            "Добавь меня в групповой чат (сделай меня админом), и я буду считать все 🐝.\n\n"
+            "Команды:\n/pchol — показать количество ПЧОЛ в чате.\n/topbees — топ 10 пользователей по 🐝."
         )
-        await message.reply(text)
     else:
-        await message.reply("Добавь меня в личные сообщения чтобы увидеть инструкцию: /start")
+        await message.reply("Напиши мне в личные сообщения /start, чтобы увидеть инструкцию.")
 
 @dp.message(Command(commands=["pchol"]))
-async def cmd_pchol(message: types.Message):
-    chat_id = message.chat.id
-    total = await db.get_total(chat_id)
+async def cmd_pchol(message: Message):
+    total = await db.get_total(message.chat.id)
     await message.reply(f"В этом чате улей на {total} ПЧОЛОВ 🐝")
 
-# --- New messages handler ---
+@dp.message(Command(commands=["top"]))
+async def cmd_topbees(message: Message):
+    chat_id = message.chat.id
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT user_id, SUM(bees_count) as total_bees
+            FROM messages
+            WHERE chat_id=$1
+            GROUP BY user_id
+            ORDER BY total_bees DESC
+            LIMIT 10
+            """,
+            chat_id
+        )
+    if not rows:
+        await message.reply("Пока никто не отправил 🐝.")
+        return
+    text = "🏆 Топ 10 ПЧОЛОВодов:\n"
+    for i, row in enumerate(rows, start=1):
+        text += f"{i}. <a href='tg://user?id={row['user_id']}'>Пользователь</a> — {row['total_bees']} 🐝\n"
+    await message.reply(text, parse_mode="HTML")
+
+# --- Messages ---
 async def on_new_message(message: Message):
     try:
-        chat_id = message.chat.id
-        message_id = message.message_id
         bees = count_bees_in_message(message)
+        user_id = message.from_user.id if message.from_user else 0
         if bees == 0:
-            await db.ensure_zero_message(chat_id, message_id)
+            await db.ensure_zero_message(message.chat.id, message.message_id, user_id)
         else:
-            await db.add_message_count(chat_id, message_id, bees)
+            await db.add_message_count(message.chat.id, message.message_id, bees, user_id)
     except Exception as e:
         logger.exception("Error handling new message: %s", e)
 
-# --- Edited messages handler ---
 async def on_edited_message(message: Message):
     try:
-        chat_id = message.chat.id
-        message_id = message.message_id
-        new_bees = count_bees_in_message(message)
-        await db.update_message_on_edit(chat_id, message_id, new_bees)
+        bees = count_bees_in_message(message)
+        user_id = message.from_user.id if message.from_user else 0
+        await db.update_message_on_edit(message.chat.id, message.message_id, bees, user_id)
     except Exception as e:
         logger.exception("Error handling edited message: %s", e)
 
-# Register generic handlers with filter for all chats
+# Register handlers
 dp.message.register(on_new_message, AllChatsFilter())
 dp.edited_message.register(on_edited_message, AllChatsFilter())
 
@@ -225,10 +221,10 @@ dp.edited_message.register(on_edited_message, AllChatsFilter())
 async def on_startup():
     logger.info("Starting up — connecting to DB...")
     await db.connect()
-    logger.info("Bot is ready.")
+    logger.info("Bot ready.")
 
 async def on_shutdown():
-    logger.info("Shutting down — closing DB and bot...")
+    logger.info("Shutting down — closing DB...")
     await db.close()
     await bot.session.close()
 
