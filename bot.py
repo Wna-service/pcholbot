@@ -460,4 +460,55 @@ async def on_confirm(callback: CallbackQuery):
     target_uid = int(uid_str)
     try:
         chat = await bot.get_chat(target_uid)
-        uname = geta
+        uname = getattr(chat, "username", None) or getattr(chat, "first_name", None)
+    except Exception:
+        uname = None
+    if action == "freeze":
+        await db.freeze_global(target_uid, uname)
+        await callback.message.edit_text(f"❄ Пользователь {('@'+uname) if uname else 'id='+str(target_uid)} глобально заморожен.")
+        await callback.answer("Пользователь заморожен.")
+    else:
+        await db.unfreeze_global(target_uid)
+        await callback.message.edit_text(f"🔓 Пользователь {('@'+uname) if uname else 'id='+str(target_uid)} разморожен.")
+        await callback.answer("Пользователь разморожен.")
+
+# -----------------------
+# Message handler — counting
+# -----------------------
+@dp.message()
+async def on_any_message(message: Message):
+    # handle only chats we care about
+    if message.chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    # compute bees
+    bees = count_bees_in_message(message)
+    if bees <= 0:
+        return
+
+    # ensure we have sender
+    sender = message.from_user
+    if not sender:
+        return
+
+    user_id = sender.id
+    username = sender.username or (sender.full_name if hasattr(sender, "full_name") else None)
+
+    # if globally frozen -> reply and ignore
+    if await db.is_globally_frozen(user_id):
+        try:
+            await message.reply("Вы были заморожены. Ваши отправленные ПЧОЛЫ не будут засчитываться ни в одном из чатов.")
+        except Exception:
+            # ignore send errors
+            pass
+        logger.debug("Ignored %d bees from frozen user %s", bees, user_id)
+        return
+
+    # check if message already processed
+    existing = await db.get_message_bees(message.chat.id, message.message_id)
+    if existing is not None:
+        # already processed (avoid double counting), but still handle if bees changed? edited messages handled separately.
+        logger.debug("Message %s in chat %s already processed", message.message_id, message.chat.id)
+        return
+
+    # Insert message record and aggregate
