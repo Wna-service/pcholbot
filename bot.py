@@ -454,4 +454,37 @@ async def on_edited_message(message: Message):
     old_bees = await db.get_message_bees(message.chat.id, message.message_id)
     # если нет старой записи — просто обработаем как новое сообщение (если не заморожен)
     if old_bees is None:
-        # если пользователь заморожен — игнорир
+        # если пользователь заморожен — игнорируем
+        if await db.is_globally_frozen(message.from_user.id):
+            return
+        if new_bees > 0:
+            await db.insert_message(message.chat.id, message.message_id, message.from_user.id, new_bees)
+            await db.add_user_bees(message.chat.id, message.from_user.id, message.from_user.username or message.from_user.full_name, new_bees)
+        return
+
+    # есть старая запись: считаем diff
+    diff = new_bees - old_bees
+    if diff == 0:
+        # просто обновим запись
+        if new_bees != old_bees:
+            await db.update_message_bees(message.chat.id, message.message_id, new_bees)
+        return
+
+    # если пользователь заморожен — игнорируем редактирование
+    if await db.is_globally_frozen(message.from_user.id):
+        return
+
+    # применяем diff
+    await db.update_message_bees(message.chat.id, message.message_id, new_bees)
+    await db.adjust_user_bees(message.chat.id, message.from_user.id, diff)
+
+# ----------------------------
+# Запуск
+# ----------------------------
+async def main():
+    await db.connect()
+    logger.info("DB connected. Starting polling...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
