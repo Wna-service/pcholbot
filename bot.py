@@ -512,3 +512,57 @@ async def on_any_message(message: Message):
         return
 
     # Insert message record and aggregate
+        await db.insert_message(message.chat.id, message.message_id, user_id, bees)
+    await db.add_user_bees(message.chat.id, user_id, username, bees)
+    logger.info("Counted %d bees from user %s in chat %s", bees, user_id, message.chat.id)
+
+# -----------------------
+# Edited message handler
+# -----------------------
+@dp.edited_message()
+async def on_edited_message(message: Message):
+    # only handle same chat types
+    if message.chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if not message.from_user:
+        return
+
+    new_bees = count_bees_in_message(message)
+    old_bees = await db.get_message_bees(message.chat.id, message.message_id)
+
+    if old_bees is None:
+        # message wasn't tracked before — treat as new if not frozen
+        if await db.is_globally_frozen(message.from_user.id):
+            return
+        if new_bees > 0:
+            await db.insert_message(message.chat.id, message.message_id, message.from_user.id, new_bees)
+            await db.add_user_bees(message.chat.id, message.from_user.id, message.from_user.username or message.from_user.full_name, new_bees)
+        return
+
+    # compute delta
+    diff = new_bees - old_bees
+    if diff == 0:
+        # just update stored value if necessary
+        if new_bees != old_bees:
+            await db.update_message_bees(message.chat.id, message.message_id, new_bees)
+        return
+
+    # if user currently frozen -> ignore edit (no change)
+    if await db.is_globally_frozen(message.from_user.id):
+        return
+
+    # apply diff
+    await db.update_message_bees(message.chat.id, message.message_id, new_bees)
+    await db.adjust_user_bees(message.chat.id, message.from_user.id, diff)
+    logger.info("Edited message %s: applied diff %d for user %s in chat %s", message.message_id, diff, message.from_user.id, message.chat.id)
+
+# -----------------------
+# Startup / run
+# -----------------------
+async def main():
+    await db.connect()
+    logger.info("Bot ready — starting polling")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
